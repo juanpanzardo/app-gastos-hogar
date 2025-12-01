@@ -4,4 +4,4 @@ gspread
 oauth2client
 plotly
 streamlit-calendar
-google-generativeai
+google-generativeai>=0.7.2
