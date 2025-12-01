@@ -26,13 +26,40 @@ def conectar_google_sheets():
         st.error(f"❌ Error de conexión: {e}")
         return None
 
-# --- CONFIGURACIÓN IA (MODO EFICIENTE) ---
+# --- CONFIGURACIÓN IA INTELIGENTE ---
 def configurar_ia():
     try:
         api_key = st.secrets["general"]["google_api_key"]
         genai.configure(api_key=api_key)
         return True
     except: return False
+
+def obtener_modelo_seguro():
+    """
+    Busca el nombre técnico exacto disponible en tu cuenta.
+    Prioriza modelos Flash (rápidos) y evita Experimentales (cuota baja).
+    """
+    try:
+        modelos_disponibles = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                modelos_disponibles.append(m.name)
+        
+        # 1. Buscar Flash Estable (ej: models/gemini-1.5-flash-001)
+        for m in modelos_disponibles:
+            if 'flash' in m and 'exp' not in m and '8b' not in m:
+                return m
+        
+        # 2. Si no hay Flash, buscar Pro Estable (ej: models/gemini-1.5-pro-001)
+        for m in modelos_disponibles:
+            if 'pro' in m and 'exp' not in m:
+                return m
+                
+        # 3. Fallback al clásico
+        return 'models/gemini-pro'
+    except:
+        # Si falla el listado, usamos el alias genérico seguro
+        return 'gemini-1.5-flash'
 
 # --- LIMPIEZA DE DATOS ---
 def limpiar_numero(valor):
@@ -54,9 +81,9 @@ def extraer_texto_pdf(uploaded_file):
         return f"Error leyendo PDF: {e}"
 
 def consultar_ia(prompt):
-    """Función centralizada para llamar a la IA con manejo de cuota"""
-    # FORZAMOS EL MODELO FLASH (Más rápido y barato en tokens)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    """Función centralizada con manejo de errores de cuota"""
+    nombre_modelo = obtener_modelo_seguro()
+    model = genai.GenerativeModel(nombre_modelo)
     
     try:
         response = model.generate_content(prompt)
@@ -64,14 +91,16 @@ def consultar_ia(prompt):
     except Exception as e:
         error_str = str(e)
         if "429" in error_str or "quota" in error_str.lower():
-            return "⏳ **Límite de velocidad alcanzado.** Por favor espera 30 segundos antes de volver a preguntar. (Estás usando la capa gratuita)."
+            return "⏳ **Límite de velocidad.** Espera unos segundos. (Modelo usado: " + nombre_modelo + ")"
+        elif "404" in error_str:
+             return f"⚠️ Error de modelo ({nombre_modelo}). Google cambió los nombres en tu región."
         else:
             return f"Error IA: {error_str}"
 
 def analizar_estado_cuenta(texto_pdf):
     prompt = f"""
     Eres un analista contable.
-    TEXTO: {texto_pdf[:30000]} 
+    TEXTO: {texto_pdf[:25000]} 
     
     TAREA: Extrae totales y fechas en JSON.
     JSON:
@@ -87,8 +116,7 @@ def analizar_estado_cuenta(texto_pdf):
     """
     respuesta = consultar_ia(prompt)
     
-    # Si la respuesta es el mensaje de error de cuota, retornamos None
-    if "⏳" in respuesta:
+    if "⏳" in respuesta or "Error" in respuesta:
         st.warning(respuesta)
         return None
 
@@ -130,8 +158,7 @@ def guardar_movimiento(hoja, datos):
 
 def guardar_memoria_ia(hoja, nombre_archivo, texto):
     try:
-        # Reducimos un poco el tamaño para ahorrar tokens en futuras consultas
-        texto_seguro = texto[:30000]
+        texto_seguro = texto[:30000] # Limite seguro
         row = [str(datetime.now()), str(date.today()), nombre_archivo, "Estado Cuenta PDF", texto_seguro]
         hoja.worksheet("Memoria_IA").append_row(row)
         return True
@@ -234,12 +261,10 @@ if sh:
     elif menu == "🤖 Asistente IA":
         st.header("Consultor Financiero (RAG)")
         
-        # --- OPTIMIZACIÓN DE MEMORIA PARA EVITAR ERROR 429 ---
         contexto_docs = ""
         if not df_memoria.empty:
-            # En lugar de enviar TODO, enviamos solo los últimos 2 documentos completos para ahorrar quota
-            # y evitar el error "Quota exceeded for tokens".
             df_memoria['Contenido_Texto'] = df_memoria['Contenido_Texto'].astype(str)
+            # Solo los últimos 2 docs completos para no saturar tokens
             ultimos_docs = df_memoria.tail(2) 
             for idx, row in ultimos_docs.iterrows():
                 contexto_docs += f"\n[DOC: {row['Nombre_Archivo']}]\n{row['Contenido_Texto']}\n"
@@ -248,7 +273,6 @@ if sh:
         Eres un experto financiero. 
         [TIEMPO REAL] Cuentas: {df_cuentas[['Nombre', 'Saldo_Actual']].to_string(index=False)}
         [MEMORIA DOCUMENTOS] {contexto_docs}
-        
         Responde basándote en la evidencia.
         """
         
@@ -260,7 +284,6 @@ if sh:
             st.session_state.msgs.append({"role": "user", "content": prompt})
             with st.chat_message("user"): st.markdown(prompt)
             
-            # Usamos la nueva función centralizada que maneja errores de quota
             respuesta_ia = consultar_ia(contexto + "\n\nUser: " + prompt)
             
             with st.chat_message("assistant"): st.markdown(respuesta_ia)
