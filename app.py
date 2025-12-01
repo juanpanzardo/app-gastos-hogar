@@ -1,104 +1,153 @@
 import streamlit as st
-from datetime import datetime
 import pandas as pd
+from datetime import datetime, date
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# Configuración de la página (Debe ser lo primero)
-st.set_page_config(
-    page_title="Gastos del Hogar AI",
-    page_icon="🏠",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# --- CONFIGURACIÓN INICIAL ---
+st.set_page_config(page_title="Gastos del Hogar AI", page_icon="🏠", layout="wide")
 
-# Título Principal
-st.title("🏠 Control de Gastos del Hogar")
+# --- CONEXIÓN CON GOOGLE SHEETS ---
+def conectar_google_sheets():
+    try:
+        # Definir el alcance (permisos)
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        
+        # Cargar credenciales desde los Secretos de Streamlit
+        creds_dict = dict(st.secrets["service_account"])
+        
+        # Crear credenciales usando gspread
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        
+        # Abrir la hoja de cálculo
+        sh = client.open("Gastos_Hogar_DB")
+        return sh
+    except Exception as e:
+        st.error(f"❌ Error al conectar con Google Sheets: {e}")
+        return None
 
-# Menú Lateral
-st.sidebar.header("Menú Principal")
-opcion = st.sidebar.radio(
-    "Ir a:",
-    ["📊 Tablero Principal", "💸 Ingresar Gasto/Ingreso", "💳 Tarjetas de Crédito", "📅 Vencimientos", "🤖 Asistente IA"]
-)
+# --- FUNCIONES DE BASE DE DATOS ---
+def cargar_datos(hoja, pestaña):
+    try:
+        worksheet = hoja.worksheet(pestaña)
+        data = worksheet.get_all_records()
+        return pd.DataFrame(data)
+    except Exception as e:
+        st.error(f"Error al leer la pestaña '{pestaña}': {e}")
+        return pd.DataFrame()
 
-st.sidebar.markdown("---")
-st.sidebar.info("Versión 0.1 - Modo Personal")
+def guardar_movimiento(hoja, datos):
+    try:
+        worksheet = hoja.worksheet("Movimientos")
+        worksheet.append_row(datos)
+        return True
+    except Exception as e:
+        st.error(f"Error al guardar: {e}")
+        return False
 
-# --- SECCIÓN: TABLERO PRINCIPAL ---
-if opcion == "📊 Tablero Principal":
-    st.header("Resumen del Mes")
+# --- INTERFAZ GRÁFICA ---
+st.title("🏠 Sistema de Gestión Financiera")
+
+# Conectar DB
+sh = conectar_google_sheets()
+
+if sh:
+    # --- MENÚ LATERAL ---
+    st.sidebar.title("Navegación")
     
-    # Métricas de ejemplo (Luego conectaremos tus datos reales)
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Saldo en Cuentas", "$ 145,200", "Santander + Efectivo")
-    col2.metric("A Pagar (Este mes)", "$ 45,427", "Alquiler + UTE")
-    col3.metric("Deuda Tarjetas", "$ 38,500", "Cierre Próximo")
-
-    st.markdown("### 🔔 Alertas Urgentes")
-    st.warning("⚠️ La UTE vence en 3 días ($2,872)")
-
-# --- SECCIÓN: INGRESAR MOVIMIENTOS ---
-elif opcion == "💸 Ingresar Gasto/Ingreso":
-    st.header("Registrar Movimiento")
+    # Botón para forzar actualización
+    if st.sidebar.button("🔄 Actualizar Datos"):
+        st.rerun()
     
-    tipo_mov = st.radio("Tipo:", ["Gasto Saliente", "Ingreso Entrante", "Transferencia"], horizontal=True)
+    st.sidebar.markdown("---")
     
-    col1, col2 = st.columns(2)
-    with col1:
-        monto = st.number_input("Monto", min_value=0.0, format="%.2f")
-        moneda = st.selectbox("Moneda", ["UYU", "USD"])
-    with col2:
-        fecha = st.date_input("Fecha", datetime.today())
-        categoria = st.selectbox("Categoría", ["Supermercado", "Servicios", "Auto", "Comida", "Salud", "Educación"])
+    menu = st.sidebar.radio(
+        "Ir a:", 
+        ["📊 Dashboard", "💸 Nuevo Movimiento", "💳 Tarjetas", "🔍 Ver Registros"]
+    )
 
-    descripcion = st.text_input("Descripción (ej. Supermercado Disco)")
+    # Cargar datos en memoria
+    df_cuentas = cargar_datos(sh, "Cuentas")
+    df_tarjetas = cargar_datos(sh, "Tarjetas")
+    df_movimientos = cargar_datos(sh, "Movimientos")
     
-    # Lógica inteligente de cuentas
-    if tipo_mov == "Gasto Saliente":
-        metodo_pago = st.selectbox("¿Cómo pagaste?", ["Efectivo", "Santander Débito", "Visa Itaú", "Oca", "BBVA"])
-        if "Visa" in metodo_pago or "Oca" in metodo_pago or "BBVA" in metodo_pago:
-            st.info(f"ℹ️ Este gasto se sumará a la deuda de {metodo_pago} y no descontará dinero ahora.")
+    # --- 1. DASHBOARD ---
+    if menu == "📊 Dashboard":
+        st.header("Estado Financiero Actual")
+        
+        # Mostrar Cuentas (Saldos)
+        st.subheader("💰 Mis Cuentas")
+        if not df_cuentas.empty:
+            # Filtramos solo columnas relevantes para mostrar limpio
+            cols = st.columns(len(df_cuentas))
+            for index, row in df_cuentas.iterrows():
+                # Evitar error si hay muchas cuentas, usando módulo
+                with cols[index % 3]: 
+                    st.metric(
+                        label=f"{row['Nombre']} ({row['Moneda']})", 
+                        value=f"${row['Saldo_Actual']:,}"
+                    )
         else:
-            st.info(f"ℹ️ Se descontará inmediatamente de {metodo_pago}.")
+            st.warning("No se encontraron cuentas. Revisa la pestaña 'Cuentas' en tu Google Sheet.")
 
-    if st.button("Guardar Movimiento", use_container_width=True):
-        st.success("✅ Movimiento registrado (Simulación)")
-
-# --- SECCIÓN: TARJETAS DE CRÉDITO ---
-elif opcion == "💳 Tarjetas de Crédito":
-    st.header("Gestión de Tarjetas")
-    
-    tab1, tab2 = st.tabs(["Estado Actual", "Cargar Estado de Cuenta"])
-    
-    with tab1:
-        st.subheader("Visa Itaú - Vencimiento: 11/09/2025")
+    # --- 2. NUEVO MOVIMIENTO ---
+    elif menu == "💸 Nuevo Movimiento":
+        st.header("Registrar Ingreso o Gasto")
         
-        col_uyu, col_usd = st.columns(2)
-        with col_uyu:
-            st.markdown("#### 🇺🇾 Pesos Uruguayos")
-            st.metric("Deuda Total", "$ 38,520")
-            st.metric("Pago Mínimo", "$ 1,500")
-            opcion_pago_uyu = st.radio("Pago UYU:", ["Pagar Total", "Pagar Mínimo", "Otro Monto"], key="pago_uyu")
-        
-        with col_usd:
-            st.markdown("#### 🇺🇸 Dólares")
-            st.metric("Deuda Total", "U$S 207.00")
-            st.metric("Pago Mínimo", "U$S 15.00")
-            opcion_pago_usd = st.radio("Pago USD:", ["Pagar Total", "Pagar Mínimo", "Otro Monto"], key="pago_usd")
+        with st.form("form_movimiento"):
+            col1, col2 = st.columns(2)
+            with col1:
+                fecha = st.date_input("Fecha", date.today())
+                tipo = st.selectbox("Tipo", ["Gasto", "Ingreso"])
+                monto = st.number_input("Monto", min_value=0.01, format="%.2f")
+            with col2:
+                moneda = st.selectbox("Moneda", ["UYU", "USD"])
+                categoria = st.selectbox("Categoría", ["Supermercado", "Servicios", "Auto", "Comida", "Salud", "Educación", "Sueldo", "Otros"])
+                
+                # Selector de Cuenta dinámico
+                lista_cuentas = df_cuentas['Nombre'].tolist() if not df_cuentas.empty else ["Efectivo"]
+                cuenta_origen = st.selectbox("Cuenta / Medio de Pago", lista_cuentas)
             
-        st.divider()
-        st.write("Simulación de Pago:")
-        if st.checkbox("Simular impacto financiero"):
-            st.warning("Si pagas solo el mínimo en Pesos, generarás aprox. $2,400 de intereses el próximo mes.")
+            descripcion = st.text_input("Descripción")
+            submitted = st.form_submit_button("💾 Guardar Movimiento")
+            
+            if submitted:
+                # ID | Fecha | Descripcion | Monto | Moneda | Categoria | Cuenta_Origen | Tipo | Comprobante_URL
+                nuevo_id = len(df_movimientos) + 1
+                datos_fila = [
+                    nuevo_id, 
+                    str(fecha), 
+                    descripcion, 
+                    monto, 
+                    moneda, 
+                    categoria, 
+                    cuenta_origen, 
+                    tipo, 
+                    ""
+                ]
+                
+                # Guardar
+                if guardar_movimiento(sh, datos_fila):
+                    st.success(f"✅ Movimiento registrado: {descripcion} - ${monto}")
+                    # Pequeña pausa para que el usuario vea el mensaje antes de recargar
+                    st.rerun() 
 
-# --- SECCIÓN: ASISTENTE IA ---
-elif opcion == "🤖 Asistente IA":
-    st.header("Consultor Financiero")
-    st.markdown("""
-    Pregúntame cosas como:
-    * *"¿Cómo vengo de gastos comparado al mes pasado?"*
-    * *"Si pago el total de la Oca, ¿me da para el alquiler?"*
-    """)
-    
-    pregunta = st.text_input("Escribe tu consulta aquí...")
-    if pregunta:
-        st.write("🤖 *Analizando tus finanzas... (Próximamente conectado a Gemini)*")
+    # --- 3. TARJETAS ---
+    elif menu == "💳 Tarjetas":
+        st.header("Gestión de Tarjetas")
+        if not df_tarjetas.empty:
+            st.dataframe(df_tarjetas)
+        else:
+            st.info("Configura tus tarjetas en la pestaña 'Tarjetas' de Google Sheets.")
+
+    # --- 4. VER REGISTROS ---
+    elif menu == "🔍 Ver Registros":
+        st.header("Historial de Movimientos")
+        if not df_movimientos.empty:
+            st.dataframe(df_movimientos)
+        else:
+            st.info("Aún no hay movimientos registrados.")
+
+else:
+    st.stop()
