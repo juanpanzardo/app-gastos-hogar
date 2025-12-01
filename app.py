@@ -23,7 +23,7 @@ def conectar_google_sheets():
         st.error(f"❌ Error de conexión: {e}")
         return None
 
-# --- CONFIGURACIÓN IA ---
+# --- CONFIGURACIÓN IA ROBUSTA ---
 def configurar_ia():
     try:
         api_key = st.secrets["general"]["google_api_key"]
@@ -31,6 +31,19 @@ def configurar_ia():
         return True
     except:
         return False
+
+def obtener_modelo_disponible():
+    """Busca automáticamente un modelo que funcione"""
+    try:
+        # Intentamos listar los modelos disponibles para tu clave
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                # Preferimos Flash por ser rápido, sino Pro
+                if 'flash' in m.name: return m.name
+                if 'gemini-pro' in m.name: return m.name
+        return 'gemini-pro' # Fallback por defecto
+    except:
+        return 'gemini-pro'
 
 # --- FUNCIONES LÓGICAS ---
 def cargar_datos(hoja, pestaña):
@@ -108,27 +121,19 @@ if sh:
         else:
             st.success("¡Todo al día!")
 
-    # 2. ASISTENTE IA (CORREGIDO)
+    # 2. ASISTENTE IA (AUTO-DETECT)
     elif menu == "🤖 Asistente IA":
         st.header("Consultor Financiero")
         
         if not ia_activa:
             st.error("❌ Error de API Key. Revisa los Secrets.")
         else:
-            # Crear contexto resumido
+            # Crear contexto
             contexto = f"""
             Eres un experto en finanzas personales. Responde en base a estos datos:
-            
-            [CUENTAS]
-            {df_cuentas[['Nombre', 'Saldo_Actual', 'Moneda']].to_string(index=False)}
-            
-            [DEUDAS PENDIENTES]
-            {df_mov[df_mov['Estado'] == 'Pendiente'][['Fecha', 'Descripcion', 'Monto', 'Moneda']].to_string(index=False)}
-            
-            [ÚLTIMOS MOVIMIENTOS]
-            {df_mov.tail(10)[['Fecha', 'Descripcion', 'Monto', 'Categoria']].to_string(index=False)}
-            
-            Responde brevemente.
+            [CUENTAS] {df_cuentas[['Nombre', 'Saldo_Actual', 'Moneda']].to_string(index=False)}
+            [DEUDAS PENDIENTES] {df_mov[df_mov['Estado'] == 'Pendiente'][['Fecha', 'Descripcion', 'Monto', 'Moneda']].to_string(index=False)}
+            [ÚLTIMOS MOVIMIENTOS] {df_mov.tail(10)[['Fecha', 'Descripcion', 'Monto', 'Categoria']].to_string(index=False)}
             """
             
             if "messages" not in st.session_state:
@@ -144,8 +149,10 @@ if sh:
                     st.markdown(prompt)
 
                 try:
-                    # CORRECCIÓN AQUÍ: Usamos gemini-1.5-flash
-                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    # BÚSQUEDA DINÁMICA DE MODELO
+                    nombre_modelo = obtener_modelo_disponible()
+                    model = genai.GenerativeModel(nombre_modelo)
+                    
                     full_prompt = contexto + "\n\nUsuario: " + prompt
                     response = model.generate_content(full_prompt)
                     
@@ -153,7 +160,8 @@ if sh:
                         st.markdown(response.text)
                     st.session_state.messages.append({"role": "assistant", "content": response.text})
                 except Exception as e:
-                    st.error(f"Error IA: {e}")
+                    st.error(f"Error IA ({nombre_modelo}): {e}")
+                    st.info("Intenta actualizar 'requirements.txt' a google-generativeai>=0.7.2")
 
     # 3. CALENDARIO
     elif menu == "📅 Calendario de Pagos":
