@@ -1,2 +1,3 @@
 Falta la opción de Categorías para el formulario de carga de movimientos.
 Permitir administrar las categorías, cuentas y tarjetas desde la interfaz.
+Permitir modificar y eliminar los registros.
