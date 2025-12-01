@@ -26,7 +26,7 @@ def conectar_google_sheets():
         st.error(f"❌ Error de conexión: {e}")
         return None
 
-# --- CONFIGURACIÓN IA ROBUSTA ---
+# --- CONFIGURACIÓN IA DINÁMICA ---
 def configurar_ia():
     try:
         api_key = st.secrets["general"]["google_api_key"]
@@ -35,23 +35,29 @@ def configurar_ia():
     except:
         return False
 
-def obtener_modelo_activo():
-    """Prueba modelos en orden de prioridad hasta encontrar uno que funcione"""
-    modelos_a_probar = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
-    
-    # Intentamos listar lo que Google nos ofrece
+def obtener_mejor_modelo():
+    """Busca en la cuenta del usuario qué modelos reales tiene disponibles"""
     try:
-        disponibles = [m.name for m in genai.list_models()]
-    except:
-        disponibles = []
-
-    # 1. Si Flash está en la lista oficial, úsalo
-    for m in modelos_a_probar:
-        if f"models/{m}" in disponibles or m in disponibles:
-            return m
+        # Listamos todos los modelos que tu API Key permite ver
+        modelos_disponibles = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                modelos_disponibles.append(m.name)
+        
+        # Prioridad: Flash > Pro 1.5 > Pro 1.0
+        for m in modelos_disponibles:
+            if 'flash' in m: return m
+        for m in modelos_disponibles:
+            if '1.5-pro' in m: return m
+        
+        # Si no encuentra preferidos, devuelve el primero que sirva
+        if modelos_disponibles:
+            return modelos_disponibles[0]
             
-    # 2. Si no pudimos listar, probamos a ciegas el clásico confiable
-    return 'gemini-pro'
+        return 'models/gemini-1.5-flash' # Fallback final
+    except Exception as e:
+        # Si falla el listado, usamos el estándar actual
+        return 'models/gemini-1.5-flash'
 
 # --- FUNCIONES DE LECTURA DE PDF ---
 def extraer_texto_pdf(uploaded_file):
@@ -65,22 +71,23 @@ def extraer_texto_pdf(uploaded_file):
         return f"Error leyendo PDF: {e}"
 
 def analizar_estado_cuenta(texto_pdf):
-    """Envía el texto a la IA para extraer datos JSON"""
-    nombre_modelo = obtener_modelo_activo()
+    nombre_modelo = obtener_mejor_modelo()
+    # st.toast(f"Usando modelo: {nombre_modelo}") # Descomentar para debug
     model = genai.GenerativeModel(nombre_modelo)
     
     prompt = f"""
-    Eres un asistente contable. Analiza este texto de un estado de cuenta de tarjeta de crédito.
+    Actúa como un sistema de extracción de datos (OCR financiero).
+    Analiza el siguiente texto de un estado de cuenta bancario.
     
     TEXTO:
-    {texto_pdf[:10000]} 
+    {texto_pdf[:15000]} 
     
-    TAREA:
-    Extrae los datos en JSON.
-    Si no encuentras un dato, pon 0.0 o la fecha de hoy.
-    Formato fecha: YYYY-MM-DD.
+    INSTRUCCIONES:
+    1. Busca la Fecha de Cierre y Fecha de Vencimiento.
+    2. Busca los Totales a Pagar y Pagos Mínimos en Pesos (UYU) y Dólares (USD).
+    3. Genera un breve análisis de gastos.
     
-    JSON ESPERADO:
+    FORMATO DE SALIDA (JSON PURO):
     {{
         "fecha_cierre": "YYYY-MM-DD",
         "fecha_vencimiento": "YYYY-MM-DD",
@@ -88,25 +95,22 @@ def analizar_estado_cuenta(texto_pdf):
         "minimo_uyu": 0.0,
         "total_usd": 0.0,
         "minimo_usd": 0.0,
-        "analisis": "Resumen breve de en qué gasté más dinero."
+        "analisis": "Resumen de texto..."
     }}
     """
     
     try:
         response = model.generate_content(prompt)
-        texto_limpio = response.text.replace("```json", "").replace("```", "").strip()
-        # A veces la IA añade texto antes del JSON, buscamos la primera {
-        inicio = texto_limpio.find("{")
-        fin = texto_limpio.rfind("}") + 1
-        json_final = texto_limpio[inicio:fin]
-        
-        datos = json.loads(json_final)
-        return datos
+        # Limpieza agresiva del JSON
+        txt = response.text.replace("```json", "").replace("```", "").strip()
+        idx_ini = txt.find("{")
+        idx_fin = txt.rfind("}") + 1
+        return json.loads(txt[idx_ini:idx_fin])
     except Exception as e:
-        st.error(f"Error IA ({nombre_modelo}): {e}")
+        st.error(f"Error procesando con IA ({nombre_modelo}): {e}")
         return None
 
-# --- FUNCIONES LÓGICAS (Mantenemos las anteriores) ---
+# --- FUNCIONES LÓGICAS DE NEGOCIO ---
 def cargar_datos(hoja, pestaña):
     try:
         worksheet = hoja.worksheet(pestaña)
@@ -116,6 +120,7 @@ def cargar_datos(hoja, pestaña):
         if not df.empty:
             for col in df.columns:
                 if col in cols_moneda:
+                    # Limpieza: quitar $, comas y convertir vacíos a 0
                     df[col] = df[col].astype(str).replace(r'[$,]', '', regex=True).replace('', '0')
                     df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         return df
@@ -136,19 +141,17 @@ def actualizar_saldo(hoja, cuenta_nombre, monto, operacion="resta"):
 def guardar_movimiento(hoja, datos):
     hoja.worksheet("Movimientos").append_row(datos)
 
-# --- INTERFAZ ---
+# --- INTERFAZ DE USUARIO ---
 st.title("🏠 Finanzas Personales & IA")
 
 sh = conectar_google_sheets()
 ia_activa = configurar_ia()
 
+# Estado de la sesión para el formulario PDF
 if 'form_data' not in st.session_state:
     st.session_state.form_data = {
-        "cierre": date.today(),
-        "venc": date.today() + timedelta(days=10),
-        "t_uyu": 0.0, "m_uyu": 0.0,
-        "t_usd": 0.0, "m_usd": 0.0,
-        "analisis": ""
+        "cierre": date.today(), "venc": date.today(),
+        "t_uyu": 0.0, "m_uyu": 0.0, "t_usd": 0.0, "m_usd": 0.0, "analisis": ""
     }
 
 if sh:
@@ -156,6 +159,7 @@ if sh:
         st.session_state.form_data = {"cierre": date.today(), "venc": date.today(), "t_uyu": 0.0, "m_uyu": 0.0, "t_usd": 0.0, "m_usd": 0.0, "analisis": ""}
         st.rerun()
     
+    # Carga de datos
     df_cuentas = cargar_datos(sh, "Cuentas")
     df_mov = cargar_datos(sh, "Movimientos")
     df_tarj = cargar_datos(sh, "Tarjetas")
@@ -166,10 +170,13 @@ if sh:
     # 1. DASHBOARD
     if menu == "📊 Dashboard":
         st.header("Resumen General")
+        
+        # Filtro de cuentas líquidas (No tarjetas)
         if 'Es_Tarjeta' in df_cuentas.columns:
             cuentas_dinero = df_cuentas[df_cuentas['Es_Tarjeta'] != 'Si']
         else:
-            cuentas_dinero = df_cuentas 
+            cuentas_dinero = df_cuentas
+            st.warning("⚠️ Crea la columna 'Es_Tarjeta' en la hoja Cuentas para diferenciar efectivo de crédito.")
 
         st.subheader("💰 Disponibilidad")
         if not cuentas_dinero.empty:
@@ -184,83 +191,88 @@ if sh:
             st.dataframe(pendientes[['Fecha', 'Descripcion', 'Monto', 'Moneda']].sort_values('Fecha').head(5), hide_index=True)
         else: st.success("¡Todo al día!")
 
-    # 2. CARGAR ESTADO DE CUENTA (AUTOMÁTICO)
+    # 2. CARGAR ESTADO CUENTA (PDF + IA)
     elif menu == "💳 Cargar Estado Cuenta (PDF)":
-        st.header("Procesar Estado de Cuenta con IA")
-        st.markdown("Sube tu archivo PDF y la IA extraerá los totales y vencimientos automáticamente.")
+        st.header("Procesar Estado de Cuenta")
         
-        uploaded_file = st.file_uploader("Arrastra tu PDF aquí", type="pdf")
+        if not ia_activa: st.error("⚠️ Configura la API Key de Google para usar esta función.")
+        
+        uploaded_file = st.file_uploader("Sube el PDF de tu tarjeta", type="pdf")
         
         if uploaded_file is not None:
-            if st.button("🤖 Analizar Documento"):
-                with st.spinner("Leyendo documento e interpretando datos..."):
+            if st.button("🤖 Leer con Inteligencia Artificial"):
+                with st.spinner("Analizando documento..."):
                     texto = extraer_texto_pdf(uploaded_file)
-                    # Usamos la nueva funcion robusta
-                    datos_ia = analizar_estado_cuenta(texto)
+                    datos = analizar_estado_cuenta(texto)
                     
-                    if datos_ia:
-                        try:
-                            # Intentamos parsear fechas, si falla usamos hoy
-                            def parse_date(d_str):
-                                try: return datetime.strptime(d_str, '%Y-%m-%d').date()
-                                except: return date.today()
+                    if datos:
+                        # Convertir strings a fechas/floats seguros
+                        def to_date(x): 
+                            try: return datetime.strptime(x, "%Y-%m-%d").date()
+                            except: return date.today()
+                        
+                        st.session_state.form_data["cierre"] = to_date(datos.get("fecha_cierre"))
+                        st.session_state.form_data["venc"] = to_date(datos.get("fecha_vencimiento"))
+                        st.session_state.form_data["t_uyu"] = float(datos.get("total_uyu", 0))
+                        st.session_state.form_data["m_uyu"] = float(datos.get("minimo_uyu", 0))
+                        st.session_state.form_data["t_usd"] = float(datos.get("total_usd", 0))
+                        st.session_state.form_data["m_usd"] = float(datos.get("minimo_usd", 0))
+                        st.session_state.form_data["analisis"] = datos.get("analisis", "")
+                        st.success("✅ Datos extraídos.")
 
-                            st.session_state.form_data["cierre"] = parse_date(datos_ia.get("fecha_cierre"))
-                            st.session_state.form_data["venc"] = parse_date(datos_ia.get("fecha_vencimiento"))
-                            st.session_state.form_data["t_uyu"] = float(datos_ia.get("total_uyu", 0))
-                            st.session_state.form_data["m_uyu"] = float(datos_ia.get("minimo_uyu", 0))
-                            st.session_state.form_data["t_usd"] = float(datos_ia.get("total_usd", 0))
-                            st.session_state.form_data["m_usd"] = float(datos_ia.get("minimo_usd", 0))
-                            st.session_state.form_data["analisis"] = datos_ia.get("analisis", "")
-                            st.success("✅ Datos extraídos.")
-                        except Exception as e:
-                            st.error(f"Error procesando datos IA: {e}")
-        
         st.divider()
         if st.session_state.form_data["analisis"]:
             st.info(f"📊 **Análisis:** {st.session_state.form_data['analisis']}")
 
-        with st.form("form_estado_cuenta"):
+        with st.form("form_estado"):
             tarjeta = st.selectbox("Tarjeta", df_tarj['Nombre'].tolist() if not df_tarj.empty else [])
             c1, c2 = st.columns(2)
             with c1:
                 f_cierre = st.date_input("Cierre", value=st.session_state.form_data["cierre"])
-                total_uyu = st.number_input("Total UYU", value=st.session_state.form_data["t_uyu"])
-                min_uyu = st.number_input("Mínimo UYU", value=st.session_state.form_data["m_uyu"])
+                t_uyu = st.number_input("Total UYU", value=st.session_state.form_data["t_uyu"])
+                m_uyu = st.number_input("Mínimo UYU", value=st.session_state.form_data["m_uyu"])
             with c2:
                 f_venc = st.date_input("Vencimiento", value=st.session_state.form_data["venc"])
-                total_usd = st.number_input("Total USD", value=st.session_state.form_data["t_usd"])
-                min_usd = st.number_input("Mínimo USD", value=st.session_state.form_data["m_usd"])
+                t_usd = st.number_input("Total USD", value=st.session_state.form_data["t_usd"])
+                m_usd = st.number_input("Mínimo USD", value=st.session_state.form_data["m_usd"])
             
-            if st.form_submit_button("💾 Guardar Resumen"):
+            if st.form_submit_button("💾 Guardar y Agendar"):
                 try:
-                    sh.worksheet("Resumenes").append_row([len(df_resum)+1, tarjeta, str(f_cierre), str(f_venc), total_uyu, min_uyu, total_usd, min_usd, "Pendiente"])
-                    if total_uyu > 0: guardar_movimiento(sh, [len(df_mov)+1, str(f_venc), f"Resumen {tarjeta} (UYU)", total_uyu, "UYU", "Tarjeta", tarjeta, "Factura Futura", "", "Pendiente", ""])
-                    if total_usd > 0: guardar_movimiento(sh, [len(df_mov)+2, str(f_venc), f"Resumen {tarjeta} (USD)", total_usd, "USD", "Tarjeta", tarjeta, "Factura Futura", "", "Pendiente", ""])
-                    st.success("¡Cargado!"); st.session_state.form_data["analisis"] = ""; st.rerun()
-                except: st.error("Falta hoja 'Resumenes'.")
+                    # Guardar Resumen
+                    sh.worksheet("Resumenes").append_row([len(df_resum)+1, tarjeta, str(f_cierre), str(f_venc), t_uyu, m_uyu, t_usd, m_usd, "Pendiente"])
+                    
+                    # Generar pendientes en calendario
+                    if t_uyu > 0:
+                        guardar_movimiento(sh, [len(df_mov)+1, str(f_venc), f"Resumen {tarjeta} (UYU)", t_uyu, "UYU", "Tarjeta", tarjeta, "Factura Futura", "", "Pendiente", ""])
+                    if t_usd > 0:
+                        guardar_movimiento(sh, [len(df_mov)+2, str(f_venc), f"Resumen {tarjeta} (USD)", t_usd, "USD", "Tarjeta", tarjeta, "Factura Futura", "", "Pendiente", ""])
+                    
+                    st.success("¡Guardado correctamente!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error al guardar: {e}")
 
     # 3. ASISTENTE IA
     elif menu == "🤖 Asistente IA":
         st.header("Consultor Financiero")
         contexto = f"""
-        Experto en finanzas. Datos:
         [CUENTAS] {df_cuentas[['Nombre', 'Saldo_Actual', 'Moneda']].to_string(index=False)}
         [PENDIENTES] {df_mov[df_mov['Estado'] == 'Pendiente'][['Fecha', 'Descripcion', 'Monto']].to_string(index=False)}
         """
-        if "messages" not in st.session_state: st.session_state.messages = []
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]): st.markdown(message["content"])
-        
+        if "msgs" not in st.session_state: st.session_state.msgs = []
+        for m in st.session_state.msgs:
+            with st.chat_message(m["role"]): st.markdown(m["content"])
+            
         if prompt := st.chat_input("Consulta..."):
-            st.session_state.messages.append({"role": "user", "content": prompt})
+            st.session_state.msgs.append({"role": "user", "content": prompt})
             with st.chat_message("user"): st.markdown(prompt)
             try:
-                nombre_modelo = obtener_modelo_activo() # Usamos la función segura
-                model = genai.GenerativeModel(nombre_modelo)
-                response = model.generate_content(contexto + "\n\nUser: " + prompt)
-                with st.chat_message("assistant"): st.markdown(response.text)
-                st.session_state.messages.append({"role": "assistant", "content": response.text})
+                # Usamos la función dinámica
+                nm = obtener_mejor_modelo()
+                model = genai.GenerativeModel(nm)
+                res = model.generate_content(contexto + "\n\nUser: " + prompt)
+                with st.chat_message("assistant"): st.markdown(res.text)
+                st.session_state.msgs.append({"role": "assistant", "content": res.text})
             except Exception as e: st.error(f"Error IA: {e}")
 
     # 4. CALENDARIO
@@ -268,41 +280,40 @@ if sh:
         st.header("Agenda de Vencimientos")
         col_cal, col_acc = st.columns([3, 1])
         with col_cal:
-            eventos = []
+            evs = []
             for i, row in df_mov.iterrows():
                 color = "#FF4B4B" if row['Estado'] == 'Pendiente' else "#28a745"
                 if row['Estado'] == 'En Tarjeta': color = "#17a2b8"
-                eventos.append({
-                    "title": f"${row['Monto']} {row['Descripcion']}", "start": row['Fecha'],
-                    "backgroundColor": color, "borderColor": color,
-                    "extendedProps": {"id": row['ID'], "monto": row['Monto'], "estado": row['Estado'], "desc": row['Descripcion'], "moneda": row['Moneda']}
-                })
-            cal = calendar(events=eventos, options={"initialView": "dayGridMonth"})
+                evs.append({"title": f"${row['Monto']} {row['Descripcion']}", "start": row['Fecha'], "backgroundColor": color, "borderColor": color, "extendedProps": {"id": row['ID'], "monto": row['Monto'], "estado": row['Estado'], "desc": row['Descripcion'], "moneda": row['Moneda']}})
+            cal = calendar(events=evs, options={"initialView": "dayGridMonth"})
         
         with col_acc:
             if cal.get("eventClick"):
                 e = cal["eventClick"]["event"]["extendedProps"]
                 st.write(f"**{e['desc']}** | {e['moneda']} {e['monto']}")
                 if e['estado'] == 'Pendiente':
+                    # Filtrar origen (no tarjetas)
                     cuentas_pago = df_cuentas[df_cuentas.get('Es_Tarjeta', pd.Series(['No']*len(df_cuentas))) != 'Si']
-                    origen = st.selectbox("Pagar desde:", cuentas_pago['Nombre'].tolist(), key="pay_origin")
+                    orig = st.selectbox("Pagar desde:", cuentas_pago['Nombre'].tolist(), key="pay_origin")
                     es_parcial = st.checkbox("¿Pago parcial?")
-                    monto_a_pagar = st.number_input("A pagar:", value=float(e['monto']), key="pay_val") if es_parcial else float(e['monto'])
+                    monto_a_pagar = st.number_input("Monto:", value=float(e['monto']), key="pay_val") if es_parcial else float(e['monto'])
+                    
                     if st.button("✅ Pagar"):
-                        actualizar_saldo(sh, origen, monto_a_pagar, "resta")
-                        ws_mov = sh.worksheet("Movimientos")
-                        cell = ws_mov.find(str(e['id']))
-                        ws_mov.update_cell(cell.row, 10, "Pagado")
-                        ws_mov.update_cell(cell.row, 11, str(date.today()))
+                        actualizar_saldo(sh, orig, monto_a_pagar, "resta")
+                        ws = sh.worksheet("Movimientos")
+                        cell = ws.find(str(e['id']))
+                        ws.update_cell(cell.row, 10, "Pagado")
+                        ws.update_cell(cell.row, 11, str(date.today()))
                         if es_parcial and monto_a_pagar < e['monto']:
-                            row_new = [len(df_mov)+500, str(date.today() + timedelta(days=30)), f"Saldo {e['desc']}", e['monto']-monto_a_pagar, e['moneda'], "Deuda", "Tarjeta", "Factura Futura", "", "Pendiente", ""]
-                            guardar_movimiento(sh, row_new)
-                        st.success("Pagado!"); st.rerun()
+                             # Generar deuda remanente
+                             row_new = [len(df_mov)+500, str(date.today()+timedelta(days=30)), f"Saldo {e['desc']}", e['monto']-monto_a_pagar, e['moneda'], "Deuda", "Tarjeta", "Factura Futura", "", "Pendiente", ""]
+                             guardar_movimiento(sh, row_new)
+                        st.success("Listo!"); st.rerun()
 
     # 5. NUEVO GASTO
     elif menu == "💸 Nuevo Gasto/Ingreso":
         st.header("Cargar Movimiento")
-        with st.form("form_nuevo"):
+        with st.form("new_mov"):
             desc = st.text_input("Descripción")
             c1, c2 = st.columns(2)
             with c1:
@@ -314,19 +325,19 @@ if sh:
                 cta = st.selectbox("Cuenta", df_cuentas['Nombre'].tolist() if not df_cuentas.empty else ["Efectivo"])
             
             if st.form_submit_button("Guardar"):
-                es_tarjeta = False
+                es_tj = False
                 if 'Es_Tarjeta' in df_cuentas.columns:
                     val = df_cuentas.loc[df_cuentas['Nombre'] == cta, 'Es_Tarjeta'].values
-                    if len(val) > 0 and val[0] == "Si": es_tarjeta = True
+                    if len(val) > 0 and val[0] == "Si": es_tj = True
                 
-                estado = "Pagado"
-                if tipo == "Factura Futura": estado = "Pendiente"
-                elif es_tarjeta and tipo == "Gasto": estado = "En Tarjeta"
+                est = "Pagado"
+                if tipo == "Factura Futura": est = "Pendiente"
+                elif es_tj and tipo == "Gasto": est = "En Tarjeta"
                 elif tipo == "Gasto": actualizar_saldo(sh, cta, monto, "resta")
                 elif tipo == "Ingreso": actualizar_saldo(sh, cta, monto, "suma")
 
-                guardar_movimiento(sh, [len(df_mov)+100, str(fecha), desc, monto, moneda, "Gral", cta, tipo, "", estado, str(date.today()) if estado=="Pagado" else ""])
-                st.success("Listo"); st.rerun()
+                guardar_movimiento(sh, [len(df_mov)+100, str(fecha), desc, monto, moneda, "Gral", cta, tipo, "", est, str(date.today()) if est=="Pagado" else ""])
+                st.success("Guardado"); st.rerun()
 
     elif menu == "🔍 Ver Datos": st.dataframe(df_mov)
 
