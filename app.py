@@ -45,31 +45,15 @@ def obtener_mejor_modelo():
         return 'models/gemini-1.5-flash'
     except: return 'models/gemini-1.5-flash'
 
-# --- FUNCIÓN DE LIMPIEZA DE MONEDA (URUGUAY) ---
+# --- LIMPIEZA DE DATOS ---
 def limpiar_numero(valor):
-    """
-    Convierte formato UYU ($ 1.500,50) a Float Python (1500.50)
-    Regla: Puntos se van, Comas se vuelven puntos.
-    """
-    if isinstance(valor, (int, float)):
-        return float(valor)
-    
-    val_str = str(valor).strip()
-    # 1. Quitar símbolos de moneda y espacios
-    val_str = val_str.replace('$', '').replace('UYU', '').replace('USD', '').strip()
-    
-    # 2. Quitar el punto de los miles (ej: 1.500 -> 1500)
-    val_str = val_str.replace('.', '')
-    
-    # 3. Cambiar la coma decimal por punto (ej: 150,50 -> 150.50)
-    val_str = val_str.replace(',', '.')
-    
-    try:
-        return float(val_str)
-    except:
-        return 0.0
+    if isinstance(valor, (int, float)): return float(valor)
+    val_str = str(valor).strip().replace('$', '').replace('UYU', '').replace('USD', '').strip()
+    val_str = val_str.replace('.', '').replace(',', '.') # Lógica Uruguay
+    try: return float(val_str)
+    except: return 0.0
 
-# --- FUNCIONES DE LECTURA DE PDF ---
+# --- LECTURA PDF ---
 def extraer_texto_pdf(uploaded_file):
     try:
         pdf_reader = pypdf.PdfReader(uploaded_file)
@@ -85,13 +69,13 @@ def analizar_estado_cuenta(texto_pdf):
     model = genai.GenerativeModel(nombre_modelo)
     
     prompt = f"""
-    Actúa como un analista contable. Extrae datos del siguiente estado de cuenta.
+    Eres un analista contable. Analiza el texto de este estado de cuenta.
     TEXTO: {texto_pdf[:15000]} 
     
-    INSTRUCCIONES CRÍTICAS:
+    TAREA:
     1. Extrae totales y mínimos en UYU y USD.
-    2. Importante: Devuelve los números como FLOTANTES (ej: 1500.50), no strings con comas.
-    3. Fechas en formato YYYY-MM-DD.
+    2. Devuelve números flotantes (1500.50).
+    3. Fechas YYYY-MM-DD.
     
     JSON:
     {{
@@ -114,39 +98,44 @@ def analizar_estado_cuenta(texto_pdf):
         st.error(f"Error IA: {e}")
         return None
 
-# --- FUNCIONES DE DATOS ---
+# --- GESTIÓN DE DATOS ---
 def cargar_datos(hoja, pestaña):
     try:
         worksheet = hoja.worksheet(pestaña)
         data = worksheet.get_all_records()
         df = pd.DataFrame(data)
-        
         cols_moneda = ['Saldo_Actual', 'Monto', 'Total_UYU', 'Minimo_UYU', 'Total_USD', 'Minimo_USD']
         if not df.empty:
             for col in df.columns:
                 if col in cols_moneda:
-                    # Aplicamos la limpieza uruguaya a toda la columna
                     df[col] = df[col].apply(limpiar_numero)
         return df
-    except:
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 def actualizar_saldo(hoja, cuenta_nombre, monto, operacion="resta"):
     try:
         ws = hoja.worksheet("Cuentas")
         cell = ws.find(cuenta_nombre)
-        # Leer valor crudo y limpiar
         val_raw = ws.cell(cell.row, 6).value
         saldo_actual = limpiar_numero(val_raw)
-        
         nuevo_saldo = saldo_actual - monto if operacion == "resta" else saldo_actual + monto
-        # Guardar formateado bonito en Google Sheets (Opcional, o guardar raw)
         ws.update_cell(cell.row, 6, nuevo_saldo)
         return True
     except: return False
 
 def guardar_movimiento(hoja, datos):
     hoja.worksheet("Movimientos").append_row(datos)
+
+def guardar_memoria_ia(hoja, nombre_archivo, texto):
+    """Guarda el texto del PDF en la hoja Memoria_IA"""
+    try:
+        # Limitamos el texto a 40.000 caracteres para no romper la celda de Excel
+        texto_seguro = texto[:40000]
+        # ID | Fecha | Archivo | Tipo | Contenido
+        row = [str(datetime.now()), str(date.today()), nombre_archivo, "Estado Cuenta PDF", texto_seguro]
+        hoja.worksheet("Memoria_IA").append_row(row)
+        return True
+    except: return False
 
 # --- INTERFAZ ---
 st.title("🏠 Finanzas Personales & IA")
@@ -155,11 +144,11 @@ sh = conectar_google_sheets()
 ia_activa = configurar_ia()
 
 if 'form_data' not in st.session_state:
-    st.session_state.form_data = {"cierre": date.today(), "venc": date.today(), "t_uyu": 0.0, "m_uyu": 0.0, "t_usd": 0.0, "m_usd": 0.0, "analisis": ""}
+    st.session_state.form_data = {"cierre": date.today(), "venc": date.today(), "t_uyu": 0.0, "m_uyu": 0.0, "t_usd": 0.0, "m_usd": 0.0, "analisis": "", "full_text": "", "filename": ""}
 
 if sh:
     if st.sidebar.button("🔄 Actualizar Datos"): 
-        st.session_state.form_data = {"cierre": date.today(), "venc": date.today(), "t_uyu": 0.0, "m_uyu": 0.0, "t_usd": 0.0, "m_usd": 0.0, "analisis": ""}
+        st.session_state.form_data = {"cierre": date.today(), "venc": date.today(), "t_uyu": 0.0, "m_uyu": 0.0, "t_usd": 0.0, "m_usd": 0.0, "analisis": "", "full_text": "", "filename": ""}
         st.rerun()
     
     df_cuentas = cargar_datos(sh, "Cuentas")
@@ -167,24 +156,23 @@ if sh:
     df_tarj = cargar_datos(sh, "Tarjetas")
     df_resum = cargar_datos(sh, "Resumenes")
     
+    # Cargamos también la memoria para el chat
+    df_memoria = cargar_datos(sh, "Memoria_IA")
+    
     menu = st.sidebar.radio("Menú Principal", ["📊 Dashboard", "💳 Cargar Estado Cuenta (PDF)", "🤖 Asistente IA", "📅 Calendario de Pagos", "💸 Nuevo Gasto/Ingreso", "🔍 Ver Datos"])
 
     # 1. DASHBOARD
     if menu == "📊 Dashboard":
         st.header("Resumen General")
-        
         if 'Es_Tarjeta' in df_cuentas.columns:
             cuentas_dinero = df_cuentas[df_cuentas['Es_Tarjeta'] != 'Si']
         else:
             cuentas_dinero = df_cuentas 
-
         st.subheader("💰 Disponibilidad")
         if not cuentas_dinero.empty:
             cols = st.columns(len(cuentas_dinero))
             for i, row in cuentas_dinero.iterrows():
-                with cols[i % 3]: 
-                    st.metric(row['Nombre'], f"${row['Saldo_Actual']:,.2f} {row['Moneda']}") # Formato con 2 decimales
-        
+                with cols[i % 3]: st.metric(row['Nombre'], f"${row['Saldo_Actual']:,.2f} {row['Moneda']}")
         st.markdown("---")
         st.subheader("📉 Próximos Vencimientos")
         pendientes = df_mov[df_mov['Estado'] == 'Pendiente']
@@ -192,7 +180,7 @@ if sh:
             st.dataframe(pendientes[['Fecha', 'Descripcion', 'Monto', 'Moneda']].sort_values('Fecha').head(5), hide_index=True)
         else: st.success("¡Todo al día!")
 
-    # 2. CARGAR PDF
+    # 2. CARGAR PDF (CON MEMORIA)
     elif menu == "💳 Cargar Estado Cuenta (PDF)":
         st.header("Procesar Estado de Cuenta")
         
@@ -213,6 +201,9 @@ if sh:
                     st.session_state.form_data["t_usd"] = float(datos.get("total_usd", 0))
                     st.session_state.form_data["m_usd"] = float(datos.get("minimo_usd", 0))
                     st.session_state.form_data["analisis"] = datos.get("analisis", "")
+                    # GUARDAMOS EL TEXTO EN MEMORIA TEMPORAL
+                    st.session_state.form_data["full_text"] = texto
+                    st.session_state.form_data["filename"] = uploaded_file.name
                     st.success("✅ Datos leídos.")
 
         st.divider()
@@ -230,27 +221,54 @@ if sh:
                 t_usd = st.number_input("Total USD", value=st.session_state.form_data["t_usd"], format="%.2f")
                 m_usd = st.number_input("Mínimo USD", value=st.session_state.form_data["m_usd"], format="%.2f")
             
-            if st.form_submit_button("💾 Guardar"):
+            save_knowledge = st.checkbox("💾 Guardar contenido en la Memoria de la IA", value=True)
+
+            if st.form_submit_button("Confirmar Carga"):
                 try:
                     sh.worksheet("Resumenes").append_row([len(df_resum)+1, tarjeta, str(f_cierre), str(f_venc), t_uyu, m_uyu, t_usd, m_usd, "Pendiente"])
                     if t_uyu > 0: guardar_movimiento(sh, [len(df_mov)+1, str(f_venc), f"Resumen {tarjeta} (UYU)", t_uyu, "UYU", "Tarjeta", tarjeta, "Factura Futura", "", "Pendiente", ""])
                     if t_usd > 0: guardar_movimiento(sh, [len(df_mov)+2, str(f_venc), f"Resumen {tarjeta} (USD)", t_usd, "USD", "Tarjeta", tarjeta, "Factura Futura", "", "Pendiente", ""])
+                    
+                    # GUARDAR EN MEMORIA IA
+                    if save_knowledge and st.session_state.form_data["full_text"]:
+                        guardar_memoria_ia(sh, st.session_state.form_data["filename"], st.session_state.form_data["full_text"])
+                        st.toast("Documento aprendido por la IA 🧠")
+                    
                     st.success("Guardado!"); st.rerun()
-                except: st.error("Error al guardar.")
+                except Exception as e: st.error(f"Error al guardar: {e}")
 
-    # 3. ASISTENTE IA
+    # 3. ASISTENTE IA (CON MEMORIA DOCUMENTAL)
     elif menu == "🤖 Asistente IA":
-        st.header("Consultor Financiero")
-        # Preparamos contexto limpio
+        st.header("Consultor Financiero (RAG)")
+        
+        # Construimos el contexto con los documentos guardados
+        contexto_docs = ""
+        if not df_memoria.empty:
+            # Tomamos los últimos 3 documentos para no saturar
+            ultimos_docs = df_memoria.tail(3)
+            for idx, row in ultimos_docs.iterrows():
+                contexto_docs += f"\n[DOCUMENTO: {row['Nombre_Archivo']} ({row['Fecha_Carga']})]:\n{row['Contenido_Texto'][:3000]}...\n"
+        
         contexto = f"""
-        [CUENTAS] {df_cuentas[['Nombre', 'Saldo_Actual', 'Moneda']].to_string(index=False)}
-        [PENDIENTES] {df_mov[df_mov['Estado'] == 'Pendiente'][['Fecha', 'Descripcion', 'Monto']].to_string(index=False)}
+        Eres un experto financiero personal. Tienes acceso a mis datos en tiempo real y a mis últimos documentos bancarios.
+        
+        [DATOS EN TIEMPO REAL]
+        - Cuentas: {df_cuentas[['Nombre', 'Saldo_Actual', 'Moneda']].to_string(index=False)}
+        - Pendientes: {df_mov[df_mov['Estado'] == 'Pendiente'][['Fecha', 'Descripcion', 'Monto']].to_string(index=False)}
+        
+        [CONTENIDO DE DOCUMENTOS ESCANEADOS (MEMORIA)]
+        {contexto_docs}
+        
+        Instrucciones:
+        1. Si pregunto por detalles de un gasto especifico, busca en los documentos escaneados.
+        2. Si pregunto por saldo actual, usa los datos en tiempo real.
         """
+        
         if "msgs" not in st.session_state: st.session_state.msgs = []
         for m in st.session_state.msgs:
             with st.chat_message(m["role"]): st.markdown(m["content"])
             
-        if prompt := st.chat_input("Consulta..."):
+        if prompt := st.chat_input("Ej: ¿Qué gastos de farmacia aparecen en el último estado de cuenta?"):
             st.session_state.msgs.append({"role": "user", "content": prompt})
             with st.chat_message("user"): st.markdown(prompt)
             try:
@@ -277,13 +295,12 @@ if sh:
             if cal.get("eventClick"):
                 e = cal["eventClick"]["event"]["extendedProps"]
                 st.write(f"**{e['desc']}**")
-                st.metric("Monto", f"{e['moneda']} {e['monto']:,.2f}") # Formato bonito
+                st.metric("Monto", f"{e['moneda']} {e['monto']:,.2f}") 
                 if e['estado'] == 'Pendiente':
                     cuentas_pago = df_cuentas[df_cuentas.get('Es_Tarjeta', pd.Series(['No']*len(df_cuentas))) != 'Si']
                     orig = st.selectbox("Pagar desde:", cuentas_pago['Nombre'].tolist(), key="pay_origin")
                     es_parcial = st.checkbox("¿Pago parcial?")
                     monto_a_pagar = st.number_input("Monto:", value=float(e['monto']), key="pay_val", format="%.2f") if es_parcial else float(e['monto'])
-                    
                     if st.button("✅ Pagar"):
                         actualizar_saldo(sh, orig, monto_a_pagar, "resta")
                         ws = sh.worksheet("Movimientos")
@@ -315,7 +332,6 @@ if sh:
                 if 'Es_Tarjeta' in df_cuentas.columns:
                     val = df_cuentas.loc[df_cuentas['Nombre'] == cta, 'Es_Tarjeta'].values
                     if len(val) > 0 and val[0] == "Si": es_tj = True
-                
                 est = "Pagado"
                 if tipo == "Factura Futura": est = "Pendiente"
                 elif es_tj and tipo == "Gasto": est = "En Tarjeta"
