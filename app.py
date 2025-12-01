@@ -8,7 +8,7 @@ from streamlit_calendar import calendar
 import google.generativeai as genai
 import pypdf
 import json
-import re
+import time
 
 # --- CONFIGURACIÓN INICIAL ---
 st.set_page_config(page_title="Gastos del Hogar AI", page_icon="🏠", layout="wide")
@@ -26,23 +26,13 @@ def conectar_google_sheets():
         st.error(f"❌ Error de conexión: {e}")
         return None
 
-# --- CONFIGURACIÓN IA ROBUSTA ---
+# --- CONFIGURACIÓN IA (MODO EFICIENTE) ---
 def configurar_ia():
     try:
         api_key = st.secrets["general"]["google_api_key"]
         genai.configure(api_key=api_key)
         return True
     except: return False
-
-def obtener_mejor_modelo():
-    try:
-        modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        # Preferimos Flash 1.5 por su ventana de contexto masiva (ideal para leer PDFs enteros)
-        for m in modelos:
-            if 'flash' in m and '1.5' in m: return m
-        if modelos: return modelos[0]
-        return 'models/gemini-1.5-flash'
-    except: return 'models/gemini-1.5-flash'
 
 # --- LIMPIEZA DE DATOS ---
 def limpiar_numero(valor):
@@ -63,15 +53,28 @@ def extraer_texto_pdf(uploaded_file):
     except Exception as e:
         return f"Error leyendo PDF: {e}"
 
+def consultar_ia(prompt):
+    """Función centralizada para llamar a la IA con manejo de cuota"""
+    # FORZAMOS EL MODELO FLASH (Más rápido y barato en tokens)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        error_str = str(e)
+        if "429" in error_str or "quota" in error_str.lower():
+            return "⏳ **Límite de velocidad alcanzado.** Por favor espera 30 segundos antes de volver a preguntar. (Estás usando la capa gratuita)."
+        else:
+            return f"Error IA: {error_str}"
+
 def analizar_estado_cuenta(texto_pdf):
-    nombre_modelo = obtener_mejor_modelo()
-    model = genai.GenerativeModel(nombre_modelo)
-    
     prompt = f"""
-    Analista contable. Analiza el texto.
-    TEXTO: {texto_pdf[:30000]}  # Aumentamos limite de analisis inicial
+    Eres un analista contable.
+    TEXTO: {texto_pdf[:30000]} 
     
-    JSON ESPERADO:
+    TAREA: Extrae totales y fechas en JSON.
+    JSON:
     {{
         "fecha_cierre": "YYYY-MM-DD",
         "fecha_vencimiento": "YYYY-MM-DD",
@@ -82,14 +85,19 @@ def analizar_estado_cuenta(texto_pdf):
         "analisis": "Resumen breve..."
     }}
     """
+    respuesta = consultar_ia(prompt)
+    
+    # Si la respuesta es el mensaje de error de cuota, retornamos None
+    if "⏳" in respuesta:
+        st.warning(respuesta)
+        return None
+
     try:
-        response = model.generate_content(prompt)
-        txt = response.text.replace("```json", "").replace("```", "").strip()
+        txt = respuesta.replace("```json", "").replace("```", "").strip()
         idx_ini = txt.find("{")
         idx_fin = txt.rfind("}") + 1
         return json.loads(txt[idx_ini:idx_fin])
-    except Exception as e:
-        st.error(f"Error IA: {e}")
+    except:
         return None
 
 # --- GESTIÓN DE DATOS ---
@@ -122,9 +130,8 @@ def guardar_movimiento(hoja, datos):
 
 def guardar_memoria_ia(hoja, nombre_archivo, texto):
     try:
-        # Google Sheets tiene limite de 50,000 caracteres por celda.
-        # Guardamos hasta 45,000 para aprovechar casi todo el PDF.
-        texto_seguro = texto[:45000]
+        # Reducimos un poco el tamaño para ahorrar tokens en futuras consultas
+        texto_seguro = texto[:30000]
         row = [str(datetime.now()), str(date.today()), nombre_archivo, "Estado Cuenta PDF", texto_seguro]
         hoja.worksheet("Memoria_IA").append_row(row)
         return True
@@ -172,7 +179,7 @@ if sh:
             st.dataframe(pendientes[['Fecha', 'Descripcion', 'Monto', 'Moneda']].sort_values('Fecha').head(5), hide_index=True)
         else: st.success("¡Todo al día!")
 
-    # 2. CARGAR PDF (CON MEMORIA FULL)
+    # 2. CARGAR PDF
     elif menu == "💳 Cargar Estado Cuenta (PDF)":
         st.header("Procesar Estado de Cuenta")
         uploaded_file = st.file_uploader("Sube el PDF de tu tarjeta", type="pdf")
@@ -210,7 +217,7 @@ if sh:
                 t_usd = st.number_input("Total USD", value=st.session_state.form_data["t_usd"], format="%.2f")
                 m_usd = st.number_input("Mínimo USD", value=st.session_state.form_data["m_usd"], format="%.2f")
             
-            save_knowledge = st.checkbox("💾 Guardar contenido COMPLETO en la Memoria", value=True)
+            save_knowledge = st.checkbox("💾 Guardar en Memoria IA", value=True)
 
             if st.form_submit_button("Confirmar Carga"):
                 try:
@@ -219,68 +226,45 @@ if sh:
                     if t_usd > 0: guardar_movimiento(sh, [len(df_mov)+2, str(f_venc), f"Resumen {tarjeta} (USD)", t_usd, "USD", "Tarjeta", tarjeta, "Factura Futura", "", "Pendiente", ""])
                     if save_knowledge and st.session_state.form_data["full_text"]:
                         guardar_memoria_ia(sh, st.session_state.form_data["filename"], st.session_state.form_data["full_text"])
-                        st.toast("Documento completo memorizado 🧠")
+                        st.toast("Guardado en memoria 🧠")
                     st.success("Guardado!"); st.rerun()
                 except Exception as e: st.error(f"Error al guardar: {e}")
 
-    # 3. ASISTENTE IA (RAG MEJORADO)
+    # 3. ASISTENTE IA
     elif menu == "🤖 Asistente IA":
-        st.header("Consultor Financiero Avanzado (RAG)")
+        st.header("Consultor Financiero (RAG)")
         
-        # --- LÓGICA DE BÚSQUEDA INTELIGENTE ---
-        # En lugar de recortar a 3000 chars, filtramos dinámicamente o enviamos todo si es reciente.
+        # --- OPTIMIZACIÓN DE MEMORIA PARA EVITAR ERROR 429 ---
         contexto_docs = ""
-        
         if not df_memoria.empty:
-            # 1. Tomamos TODOS los documentos (sin límite de filas, pero cuidado con el tamaño total)
-            # Como Gemini 1.5 Flash soporta muchísimo texto, enviaremos los ultimos 3 ENTEROS.
-            # Convertimos a string para asegurar
+            # En lugar de enviar TODO, enviamos solo los últimos 2 documentos completos para ahorrar quota
+            # y evitar el error "Quota exceeded for tokens".
             df_memoria['Contenido_Texto'] = df_memoria['Contenido_Texto'].astype(str)
-            
-            # Filtramos documentos vacíos
-            docs_validos = df_memoria[df_memoria['Contenido_Texto'].str.len() > 10]
-            
-            # Tomamos los últimos 5 documentos COMPLETOS (hasta 40k chars cada uno)
-            ultimos_docs = docs_validos.tail(5) 
-            
+            ultimos_docs = df_memoria.tail(2) 
             for idx, row in ultimos_docs.iterrows():
-                contexto_docs += f"\n--- INICIO DOCUMENTO: {row['Nombre_Archivo']} ({row['Fecha_Carga']}) ---\n"
-                contexto_docs += row['Contenido_Texto'] # TEXTO COMPLETO, SIN RECORTE
-                contexto_docs += "\n--- FIN DOCUMENTO ---\n"
+                contexto_docs += f"\n[DOC: {row['Nombre_Archivo']}]\n{row['Contenido_Texto']}\n"
 
         contexto = f"""
-        Eres un auditor financiero forense. Tienes acceso a los estados de cuenta COMPLETOS del usuario.
+        Eres un experto financiero. 
+        [TIEMPO REAL] Cuentas: {df_cuentas[['Nombre', 'Saldo_Actual']].to_string(index=False)}
+        [MEMORIA DOCUMENTOS] {contexto_docs}
         
-        TAREA:
-        El usuario te hará preguntas sobre sus gastos (ej: "Uber", "Farmacia").
-        Debes buscar EXTRACTAMENTE en el texto de los documentos provistos.
-        No inventes datos. Si aparece 10 veces, dilo. Si no aparece, dilo.
-        
-        [DATOS ACTUALES]
-        - Saldos: {df_cuentas[['Nombre', 'Saldo_Actual']].to_string(index=False)}
-        
-        [DOCUMENTOS ESCANEADOS (TEXTO COMPLETO)]
-        {contexto_docs}
+        Responde basándote en la evidencia.
         """
         
         if "msgs" not in st.session_state: st.session_state.msgs = []
         for m in st.session_state.msgs:
             with st.chat_message(m["role"]): st.markdown(m["content"])
             
-        if prompt := st.chat_input("Ej: Busca todos los gastos de Uber en el último estado"):
+        if prompt := st.chat_input("Consulta..."):
             st.session_state.msgs.append({"role": "user", "content": prompt})
             with st.chat_message("user"): st.markdown(prompt)
-            try:
-                nm = obtener_mejor_modelo()
-                model = genai.GenerativeModel(nm)
-                # CONFIGURACIÓN IMPORTANTE: Temperatura 0 para que sea exacto y analítico
-                res = model.generate_content(
-                    contexto + "\n\nUSUARIO: " + prompt,
-                    generation_config=genai.types.GenerationConfig(temperature=0.0)
-                )
-                with st.chat_message("assistant"): st.markdown(res.text)
-                st.session_state.msgs.append({"role": "assistant", "content": res.text})
-            except Exception as e: st.error(f"Error IA: {e}")
+            
+            # Usamos la nueva función centralizada que maneja errores de quota
+            respuesta_ia = consultar_ia(contexto + "\n\nUser: " + prompt)
+            
+            with st.chat_message("assistant"): st.markdown(respuesta_ia)
+            st.session_state.msgs.append({"role": "assistant", "content": respuesta_ia})
 
     # 4. CALENDARIO
     elif menu == "📅 Calendario de Pagos":
