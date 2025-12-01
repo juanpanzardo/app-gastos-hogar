@@ -35,6 +35,7 @@ def configurar_ia():
     except: return False
 
 def obtener_modelo_seguro():
+    """Selecciona modelo evitando experimentales para no saturar cuota"""
     try:
         modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         for m in modelos:
@@ -43,7 +44,7 @@ def obtener_modelo_seguro():
         return 'models/gemini-1.5-flash'
     except: return 'gemini-1.5-flash'
 
-# --- UTILIDADES ---
+# --- UTILIDADES DE LIMPIEZA ---
 def limpiar_numero(valor):
     if isinstance(valor, (int, float)): return float(valor)
     val_str = str(valor).strip().replace('$', '').replace('UYU', '').replace('USD', '').strip()
@@ -51,25 +52,35 @@ def limpiar_numero(valor):
     try: return float(val_str)
     except: return 0.0
 
-# --- LÓGICA FINANCIERA CENTRAL ---
+# --- LÓGICA FINANCIERA CENTRAL (CORREGIDA) ---
 def actualizar_saldo(hoja, cuenta_nombre, monto, operacion="resta"):
     """
-    operacion: 'resta' (gastar), 'suma' (ingresar/devolver)
+    Actualiza el saldo buscando dinámicamente la columna 'Saldo_Actual'.
     """
     try:
         ws = hoja.worksheet("Cuentas")
         cell = ws.find(cuenta_nombre)
-        val_raw = ws.cell(cell.row, 6).value # Asumiendo Saldo en Col 6
+        
+        # BUSCAR LA COLUMNA CORRECTA AUTOMÁTICAMENTE
+        headers = ws.row_values(1) # Leemos la fila 1
+        if "Saldo_Actual" in headers:
+            col_idx = headers.index("Saldo_Actual") + 1
+        else:
+            col_idx = 5 # Fallback a columna E si no encuentra nombre
+            
+        val_raw = ws.cell(cell.row, col_idx).value 
         saldo_actual = limpiar_numero(val_raw)
         
         nuevo_saldo = saldo_actual - monto if operacion == "resta" else saldo_actual + monto
-        ws.update_cell(cell.row, 6, nuevo_saldo)
+        ws.update_cell(cell.row, col_idx, nuevo_saldo)
         return True
-    except: return False
+    except Exception as e: 
+        st.error(f"Error actualizando saldo: {e}")
+        return False
 
 def revertir_impacto_saldo(hoja, movimiento):
     """
-    Deshace el efecto matemático de un movimiento en el saldo.
+    Deshace el efecto matemático de un movimiento.
     """
     try:
         tipo = movimiento['Tipo']
@@ -77,21 +88,17 @@ def revertir_impacto_saldo(hoja, movimiento):
         cuenta = movimiento['Cuenta_Origen']
         monto = limpiar_numero(movimiento['Monto'])
         
-        # Solo revertimos si afectó el saldo real (Pagado/Ingresado)
-        # Si estaba 'Pendiente' o 'En Tarjeta', no tocó el saldo, así que no hacemos nada.
         if estado == "Pagado" and tipo == "Gasto":
-            # Si era gasto pagado, devolvemos la plata (suma)
-            actualizar_saldo(hoja, cuenta, monto, "suma")
-            st.toast(f"💰 Se devolvieron ${monto} a {cuenta}")
+            actualizar_saldo(hoja, cuenta, monto, "suma") # Devolver plata
+            st.toast(f"💰 Reembolsados ${monto} a {cuenta}")
             
         elif estado == "Pagado" and tipo == "Ingreso":
-            # Si era ingreso, se lo quitamos (resta)
-            actualizar_saldo(hoja, cuenta, monto, "resta")
-            st.toast(f"💸 Se descontaron ${monto} de {cuenta}")
+            actualizar_saldo(hoja, cuenta, monto, "resta") # Quitar plata
+            st.toast(f"💸 Retirados ${monto} de {cuenta}")
             
         return True
     except Exception as e:
-        st.error(f"Error revirtiendo saldo: {e}")
+        st.error(f"Error revirtiendo: {e}")
         return False
 
 # --- GESTIÓN DE DATOS ---
@@ -119,33 +126,25 @@ def borrar_fila_movimiento(hoja, id_movimiento):
         return True
     except: return False
 
-def editar_movimiento_fila(hoja, id_movimiento, nuevos_datos_dict):
-    """
-    Sobreescribe una fila existente.
-    nuevos_datos_dict: {'Fecha':..., 'Descripcion':...}
-    """
+def editar_movimiento_fila(hoja, id_movimiento, nuevos_datos):
     try:
         ws = hoja.worksheet("Movimientos")
         cell = ws.find(str(id_movimiento))
         row = cell.row
-        
-        # Mapeo de columnas (Ajustar según tu Excel)
-        # ID=1, Fecha=2, Desc=3, Monto=4, Mon=5, Cat=6, Origen=7, Tipo=8, URL=9, Estado=10, FPago=11
-        ws.update_cell(row, 2, str(nuevos_datos_dict['Fecha']))
-        ws.update_cell(row, 3, nuevos_datos_dict['Descripcion'])
-        ws.update_cell(row, 4, nuevos_datos_dict['Monto'])
-        ws.update_cell(row, 5, nuevos_datos_dict['Moneda'])
-        ws.update_cell(row, 6, nuevos_datos_dict['Categoria'])
-        ws.update_cell(row, 7, nuevos_datos_dict['Cuenta_Origen'])
-        ws.update_cell(row, 8, nuevos_datos_dict['Tipo'])
-        # Estado y F.Pago dependen de la lógica, aquí asumimos que el usuario los define o se mantienen
-        ws.update_cell(row, 10, nuevos_datos_dict['Estado'])
+        # Mapeo fijo de columnas para editar (Ajustado a tu estructura)
+        # 1:ID, 2:Fecha, 3:Desc, 4:Monto, 5:Moneda, 6:Cat, 7:Origen, 8:Tipo, 9:URL, 10:Estado
+        ws.update_cell(row, 2, str(nuevos_datos['Fecha']))
+        ws.update_cell(row, 3, nuevos_datos['Descripcion'])
+        ws.update_cell(row, 4, nuevos_datos['Monto'])
+        ws.update_cell(row, 5, nuevos_datos['Moneda'])
+        ws.update_cell(row, 6, nuevos_datos['Categoria'])
+        ws.update_cell(row, 7, nuevos_datos['Cuenta_Origen'])
+        ws.update_cell(row, 8, nuevos_datos['Tipo'])
+        ws.update_cell(row, 10, nuevos_datos['Estado'])
         return True
-    except Exception as e:
-        st.error(f"Error editando: {e}")
-        return False
+    except: return False
 
-# --- IA LECTURA ---
+# --- IA Y LECTURA ---
 def extraer_texto_pdf(uploaded_file):
     try:
         pdf_reader = pypdf.PdfReader(uploaded_file)
@@ -160,7 +159,7 @@ def consultar_ia(prompt):
     try:
         return model.generate_content(prompt).text
     except Exception as e:
-        if "429" in str(e): return "⏳ Cuota excedida. Espera un momento."
+        if "429" in str(e): return "⏳ Cuota excedida. Espera unos segundos."
         return f"Error: {e}"
 
 def analizar_estado_cuenta(texto):
@@ -170,6 +169,12 @@ def analizar_estado_cuenta(texto):
         txt = res.replace("```json", "").replace("```", "").strip()
         return json.loads(txt[txt.find("{"):txt.rfind("}")+1])
     except: return None
+
+def guardar_memoria_ia(hoja, nombre, texto):
+    try:
+        hoja.worksheet("Memoria_IA").append_row([str(datetime.now()), str(date.today()), nombre, "PDF", texto[:30000]])
+        return True
+    except: return False
 
 # --- INTERFAZ ---
 st.title("🏠 Finanzas Personales & IA")
@@ -181,11 +186,14 @@ if 'form_data' not in st.session_state:
     st.session_state.form_data = {"cierre": date.today(), "venc": date.today(), "t_uyu": 0.0, "m_uyu": 0.0, "t_usd": 0.0, "m_usd": 0.0, "analisis": "", "full_text": "", "filename": ""}
 
 if sh:
-    if st.sidebar.button("🔄 Actualizar Datos"): st.rerun()
+    if st.sidebar.button("🔄 Actualizar Datos"): 
+        st.session_state.form_data = {"cierre": date.today(), "venc": date.today(), "t_uyu": 0.0, "m_uyu": 0.0, "t_usd": 0.0, "m_usd": 0.0, "analisis": "", "full_text": "", "filename": ""}
+        st.rerun()
     
     df_cuentas = cargar_datos(sh, "Cuentas")
     df_mov = cargar_datos(sh, "Movimientos")
     df_tarj = cargar_datos(sh, "Tarjetas")
+    df_memoria = cargar_datos(sh, "Memoria_IA")
     
     menu = st.sidebar.radio("Menú", ["📊 Dashboard", "🤖 Asistente IA", "📅 Calendario", "💳 Cargar Estado Cuenta", "💸 Nuevo Movimiento", "📝 Gestionar Movimientos"])
 
@@ -211,7 +219,14 @@ if sh:
     # 2. IA
     elif menu == "🤖 Asistente IA":
         st.header("Consultor Financiero")
-        ctx = f"[CUENTAS] {df_cuentas[['Nombre','Saldo_Actual']].to_string(index=False)} \n [PENDIENTES] {df_mov[df_mov['Estado']=='Pendiente'][['Fecha','Descripcion','Monto']].to_string(index=False)}"
+        # Contexto RAG limitado para velocidad
+        ctx_docs = ""
+        if not df_memoria.empty:
+            df_memoria['Contenido_Texto'] = df_memoria['Contenido_Texto'].astype(str)
+            for i, r in df_memoria.tail(2).iterrows(): ctx_docs += f"\n[DOC: {r['Nombre_Archivo']}]\n{r['Contenido_Texto'][:5000]}..."
+            
+        ctx = f"[CUENTAS] {df_cuentas[['Nombre','Saldo_Actual']].to_string(index=False)} \n [DOCS] {ctx_docs}"
+        
         if "msgs" not in st.session_state: st.session_state.msgs = []
         for m in st.session_state.msgs:
             with st.chat_message(m["role"]): st.write(m["content"])
@@ -261,21 +276,30 @@ if sh:
                 txt = extraer_texto_pdf(up)
                 dat = analizar_estado_cuenta(txt)
                 if dat:
-                    st.session_state.form_data.update({"cierre":dat.get("fecha_cierre"), "venc":dat.get("fecha_vencimiento"), "t_uyu":dat.get("total_uyu",0), "t_usd":dat.get("total_usd",0)})
+                    def to_d(x):
+                        try: return datetime.strptime(x, "%Y-%m-%d").date()
+                        except: return date.today()
+                    st.session_state.form_data.update({
+                        "cierre":to_d(dat.get("fecha_cierre")), 
+                        "venc":to_d(dat.get("fecha_vencimiento")), 
+                        "t_uyu":float(dat.get("total_uyu",0)), "t_usd":float(dat.get("total_usd",0)),
+                        "full_text": txt, "filename": up.name
+                    })
                     st.success("Datos leídos")
         
         with st.form("form_pdf"):
             tj = st.selectbox("Tarjeta", df_tarj['Nombre'].tolist() if not df_tarj.empty else [])
             c1, c2 = st.columns(2)
-            with c1:
-                t_uyu = st.number_input("Total UYU", value=float(st.session_state.form_data['t_uyu']))
-            with c2:
-                t_usd = st.number_input("Total USD", value=float(st.session_state.form_data['t_usd']))
-            f_venc = st.date_input("Vencimiento", value=pd.to_datetime(st.session_state.form_data['venc']).date())
+            with c1: t_uyu = st.number_input("Total UYU", value=float(st.session_state.form_data['t_uyu']))
+            with c2: t_usd = st.number_input("Total USD", value=float(st.session_state.form_data['t_usd']))
+            f_venc = st.date_input("Vencimiento", value=st.session_state.form_data.get('venc', date.today()))
+            memoria = st.checkbox("Guardar en Memoria", value=True)
             
             if st.form_submit_button("Guardar"):
                 if t_uyu > 0: guardar_movimiento(sh, [len(df_mov)+1, str(f_venc), f"Resumen {tj} UYU", t_uyu, "UYU", "Tarjeta", tj, "Factura Futura", "", "Pendiente", ""])
                 if t_usd > 0: guardar_movimiento(sh, [len(df_mov)+2, str(f_venc), f"Resumen {tj} USD", t_usd, "USD", "Tarjeta", tj, "Factura Futura", "", "Pendiente", ""])
+                if memoria and st.session_state.form_data["full_text"]:
+                    guardar_memoria_ia(sh, st.session_state.form_data["filename"], st.session_state.form_data["full_text"])
                 st.success("Guardado"); st.rerun()
 
     # 5. NUEVO MOVIMIENTO
@@ -304,89 +328,37 @@ if sh:
                 guardar_movimiento(sh, [len(df_mov)+100, str(f), desc, m, mon, "Gral", cta, t, "", est, str(date.today()) if est=="Pagado" else ""])
                 st.success("Guardado"); st.rerun()
 
-    # ==============================================================================
-    # 6. GESTIONAR MOVIMIENTOS (NUEVA FUNCIONALIDAD)
-    # ==============================================================================
+    # 6. GESTIONAR
     elif menu == "📝 Gestionar Movimientos":
-        st.header("Administrar Registros")
-        st.info("⚠️ Aquí puedes eliminar o corregir errores. Si borras un gasto pagado, el dinero volverá a tu cuenta automáticamente.")
+        st.header("Administrar")
+        filtro = st.text_input("🔍 Buscar:")
+        df_show = df_mov.copy()
+        if filtro: df_show = df_show[df_show.astype(str).apply(lambda x: x.str.contains(filtro, case=False)).any(axis=1)]
+        st.dataframe(df_show, use_container_width=True)
         
-        # Filtros básicos para encontrar fácil
-        filtro = st.text_input("🔍 Buscar por descripción o monto:")
-        
-        df_display = df_mov.copy()
-        if filtro:
-            df_display = df_display[df_display.astype(str).apply(lambda x: x.str.contains(filtro, case=False)).any(axis=1)]
-        
-        # Mostramos tabla interactiva simple
-        st.dataframe(df_display, use_container_width=True)
-        
-        st.divider()
-        st.subheader("🛠️ Acciones")
-        
-        # Selector de ID para operar
-        lista_ids = df_display['ID'].tolist()
-        id_selec = st.selectbox("Selecciona el ID del movimiento a modificar/eliminar:", lista_ids)
-        
-        if id_selec:
-            # Recuperamos los datos de ese movimiento
-            mov_data = df_mov[df_mov['ID'] == id_selec].iloc[0]
-            
-            col_edit, col_del = st.columns(2)
-            
-            # --- SECCIÓN ELIMINAR ---
-            with col_del:
-                st.markdown("### 🗑️ Eliminar")
-                st.warning(f"Vas a eliminar: **{mov_data['Descripcion']}** (${mov_data['Monto']})")
-                if st.button("Confirmar Eliminación", type="primary"):
-                    with st.spinner("Eliminando y ajustando saldos..."):
-                        # 1. Revertir saldo (Devolver plata si era gasto, quitar si era ingreso)
-                        revertir_impacto_saldo(sh, mov_data)
-                        # 2. Borrar fila de Excel
-                        borrar_fila_movimiento(sh, id_selec)
-                        st.success("Movimiento eliminado y saldos ajustados.")
-                        time.sleep(1)
-                        st.rerun()
-
-            # --- SECCIÓN EDITAR ---
-            with col_edit:
-                st.markdown("### ✏️ Editar")
-                with st.expander("Abrir formulario de edición"):
-                    with st.form("form_editar"):
-                        e_desc = st.text_input("Descripción", value=mov_data['Descripcion'])
-                        e_monto = st.number_input("Monto", value=float(mov_data['Monto']))
-                        e_fecha = st.date_input("Fecha", value=pd.to_datetime(mov_data['Fecha']).date())
-                        e_cta = st.selectbox("Cuenta", df_cuentas['Nombre'].tolist(), index=df_cuentas['Nombre'].tolist().index(mov_data['Cuenta_Origen']) if mov_data['Cuenta_Origen'] in df_cuentas['Nombre'].tolist() else 0)
-                        
-                        if st.form_submit_button("Guardar Cambios"):
-                            # Lógica de edición segura:
-                            # 1. Revertimos el movimiento viejo (como si lo borráramos)
-                            revertir_impacto_saldo(sh, mov_data)
-                            
-                            # 2. Preparamos el nuevo movimiento
-                            # Determinar si el NUEVO movimiento afecta saldo
-                            # (Simplificación: Asumimos que mantenemos el Tipo y Estado originales pero con nuevos valores)
-                            # Si cambiamos de cuenta, la reversión afectó a la vieja, y ahora afectaremos a la nueva.
-                            
-                            nuevo_tipo = mov_data['Tipo']
-                            nuevo_estado = mov_data['Estado']
-                            
-                            # Si es Gasto Pagado, descontamos el NUEVO monto de la NUEVA cuenta
-                            if nuevo_estado == "Pagado" and nuevo_tipo == "Gasto":
-                                actualizar_saldo(sh, e_cta, e_monto, "resta")
-                            elif nuevo_estado == "Pagado" and nuevo_tipo == "Ingreso":
-                                actualizar_saldo(sh, e_cta, e_monto, "suma")
-                            
-                            # 3. Actualizamos la fila en Excel
-                            nuevos_datos = {
-                                'Fecha': e_fecha, 'Descripcion': e_desc, 'Monto': e_monto,
-                                'Moneda': mov_data['Moneda'], 'Categoria': mov_data['Categoria'],
-                                'Cuenta_Origen': e_cta, 'Tipo': nuevo_tipo, 'Estado': nuevo_estado
-                            }
-                            editar_movimiento_fila(sh, id_selec, nuevos_datos)
-                            
-                            st.success("Movimiento actualizado y saldos recalculados.")
-                            time.sleep(1)
-                            st.rerun()
+        ids = df_show['ID'].tolist()
+        id_sel = st.selectbox("ID a modificar:", ids)
+        if id_sel:
+            mov = df_mov[df_mov['ID']==id_sel].iloc[0]
+            c_edit, c_del = st.columns(2)
+            with c_del:
+                st.warning(f"Eliminar: {mov['Descripcion']} ({mov['Monto']})")
+                if st.button("Eliminar Definitivamente"):
+                    revertir_impacto_saldo(sh, mov)
+                    borrar_fila_movimiento(sh, id_sel)
+                    st.success("Eliminado"); time.sleep(1); st.rerun()
+            with c_edit:
+                with st.form("edit"):
+                    ed_desc = st.text_input("Desc", value=mov['Descripcion'])
+                    ed_monto = st.number_input("Monto", value=float(mov['Monto']))
+                    ed_fecha = st.date_input("Fecha", value=pd.to_datetime(mov['Fecha']).date())
+                    ed_cta = st.selectbox("Cuenta", df_cuentas['Nombre'].tolist(), index=df_cuentas['Nombre'].tolist().index(mov['Cuenta_Origen']) if mov['Cuenta_Origen'] in df_cuentas['Nombre'].tolist() else 0)
+                    if st.form_submit_button("Guardar Cambios"):
+                        revertir_impacto_saldo(sh, mov)
+                        if mov['Estado'] == "Pagado" and mov['Tipo'] == "Gasto": actualizar_saldo(sh, ed_cta, ed_monto, "resta")
+                        elif mov['Estado'] == "Pagado" and mov['Tipo'] == "Ingreso": actualizar_saldo(sh, ed_cta, ed_monto, "suma")
+                        nuevos = {'Fecha':ed_fecha, 'Descripcion':ed_desc, 'Monto':ed_monto, 'Moneda':mov['Moneda'], 'Categoria':mov['Categoria'], 'Cuenta_Origen':ed_cta, 'Tipo':mov['Tipo'], 'Estado':mov['Estado']}
+                        editar_movimiento_fila(sh, id_sel, nuevos)
+                        st.success("Editado"); time.sleep(1); st.rerun()
 
 else: st.stop()
